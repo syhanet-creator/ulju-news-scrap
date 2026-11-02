@@ -11,7 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
@@ -680,21 +680,24 @@ def fill_authors(arts, limit=30):
         a["author"] = _authors.get(a["link"], "")
 
 
-def collect_tab(tab_id, days, fast=False):
-    """탭 하나의 기사를 수집한다. 지역 신문은 local 탭(새울본부)에서만 함께 읽는다."""
+def collect_tab(tab_id, days, fast=False, authors=True, budget=None):
+    """탭 하나의 기사를 수집한다. 지역 신문은 local 탭(새울본부)에서만 함께 읽는다.
+    authors=False 면 기자 이름 보충을 건너뛰고, budget(초)이 있으면 그 시간 안에 끝난 출처만 쓴다(AI 요약용)."""
     tab = TABS.get(tab_id)
     if not tab:
         return {"error": "알 수 없는 탭입니다."}
     # 전체 탭은 메인(울주군) 탭 키워드에만 지역 신문을 읽는다. 그 밖의 탭은 탭이 정한 신문만(local_sources).
     use_local = set(TABS[MAIN_TAB]["keywords"]) if tab.get("all") else bool(tab.get("local"))
     data = collect(days, tab["keywords"], fast=fast, use_local=use_local,
-                   papers=None if tab.get("all") else local_sources(tab))
+                   papers=None if tab.get("all") else local_sources(tab), authors=authors, budget=budget)
     data["tab"] = tab_id
     return data
 
 
-def collect(days, kws=None, fast=False, use_local=True, papers=None):
-    """fast=True 면 구글 뉴스만(빠른 첫 화면). 아니면 use_local 일 때 지역 신문까지."""
+def collect(days, kws=None, fast=False, use_local=True, papers=None, authors=True, budget=None):
+    """fast=True 면 구글 뉴스만(빠른 첫 화면). 아니면 use_local 일 때 지역 신문까지.
+    authors=False: 기자 이름 보충(본문 페이지 접속)을 건너뛴다. budget(초): 이 시간이 지나면 아직 응답 없는 출처는
+    기다리지 않고 빼 둔다(결과의 timed_out=True). 둘 다 기본값이면 예전과 똑같이 동작한다."""
     kws = [k for k in (kws or KEYWORDS)][:60]
 
     def sources_for(kw):  # use_local: True(전부) / 키워드 집합(그 키워드만) / False
@@ -703,9 +706,19 @@ def collect(days, kws=None, fast=False, use_local=True, papers=None):
         return SOURCES if papers is None else [s for s in SOURCES if s[0] == "google" or s[0] in papers]
     jobs = [(kw, name, fn) for kw in kws for name, fn in sources_for(kw)]
     merged, failed = {}, {}
-    with ThreadPoolExecutor(max(1, len(jobs))) as ex:
-        futs = [(kw, name, ex.submit(_cached, name, fn, kw, days)) for kw, name, fn in jobs]
+    ex = ThreadPoolExecutor(max(1, len(jobs)))
+    futs = [(kw, name, ex.submit(_cached, name, fn, kw, days)) for kw, name, fn in jobs]
+    timed_out = False
+    if budget is None:
+        ex.shutdown(wait=True)
+    else:
+        wait([f for _, _, f in futs], timeout=budget)
+        ex.shutdown(wait=False, cancel_futures=True)  # 늦은 출처는 기다리지 않는다(백그라운드에서 끝나면 캐시에는 남는다)
     for kw, name, f in futs:
+        if budget is not None and (not f.done() or f.cancelled()):
+            timed_out = True
+            failed.setdefault(name, f"{name}: 응답이 느려 일부 결과가 빠졌을 수 있습니다")
+            continue
         try:
             for a in f.result():
                 if a["source"] not in TRUSTED_SOURCES and not title_relevant(kw, a["title"]):
@@ -724,10 +737,10 @@ def collect(days, kws=None, fast=False, use_local=True, papers=None):
             failed.setdefault(name, f"{name}: 응답이 느려 일부 결과가 빠졌을 수 있습니다")
             LAST_FAIL[name] = f"{type(e).__name__}: {str(e)[:120]} (키워드 {kw}, {datetime.now(KST).strftime('%H:%M:%S')})"
     arts = sorted((a for a in merged.values() if not a["spam"]), key=lambda a: a["ts"], reverse=True)  # 스팸은 항상 제외
-    if not fast and use_local:
+    if not fast and use_local and authors:
         fill_authors(arts)
     cluster(arts)
-    return {"articles": arts, "errors": list(failed.values()), "keywords": kws,
+    return {"articles": arts, "errors": list(failed.values()), "keywords": kws, "timed_out": timed_out,
             "fetched": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")}
 
 
@@ -764,8 +777,17 @@ def _friendly(code, detail):
     return f"HTTP {code}: {detail[:200]}"
 
 
-def _ask_llm(prompt):
-    """GEMINI_API_KEY 가 있으면 Gemini, 없으면 ANTHROPIC_API_KEY 로 Claude 호출."""
+def _ask_llm(prompt, deadline=None):
+    """GEMINI_API_KEY 가 있으면 Gemini, 없으면 ANTHROPIC_API_KEY 로 Claude 호출.
+    deadline(time.time() 기준 시각)이 있으면 남은 시간 안에서만 호출하고, 모델을 바꿔 재시도하다 넘기지 않는다."""
+    def left(cap):
+        if deadline is None:
+            return cap
+        rem = deadline - time.time()
+        if rem < 4:
+            raise TimeoutError("AI 요약 제한 시간을 넘겼습니다")
+        return min(cap, rem - 1)
+
     gkey = os.environ.get("GEMINI_API_KEY")
     if gkey:
         last = None
@@ -775,14 +797,16 @@ def _ask_llm(prompt):
                 r = _post_json(
                     f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                     {"x-goog-api-key": gkey},
-                    {"contents": [{"parts": [{"text": prompt}]}]}, timeout=18)
+                    {"contents": [{"parts": [{"text": prompt}]}]}, timeout=left(18))
                 return r["candidates"][0]["content"]["parts"][0]["text"]
             except ApiError as e:
                 last = e
                 if e.code not in (404, 429, 500, 503):
                     raise
-            except TimeoutError as e:
+            except (TimeoutError, urllib.error.URLError) as e:  # 연결 시간 초과도 다음 모델로
                 last = e
+                if deadline is not None and deadline - time.time() < 4:
+                    break
         raise last
     akey = os.environ.get("ANTHROPIC_API_KEY")
     if akey:
@@ -790,7 +814,7 @@ def _ask_llm(prompt):
             "https://api.anthropic.com/v1/messages",
             {"x-api-key": akey, "anthropic-version": "2023-06-01"},
             {"model": CLAUDE_MODEL, "max_tokens": 1200,
-             "messages": [{"role": "user", "content": prompt}]})
+             "messages": [{"role": "user", "content": prompt}]}, timeout=left(50))
         return r["content"][0]["text"]
     raise RuntimeError("GEMINI_API_KEY 또는 ANTHROPIC_API_KEY 환경변수가 설정되지 않았습니다.")
 
@@ -804,7 +828,10 @@ def weekly_summary(days=7, tab_id=None):
     hit = _cache.get(ck)
     if hit and time.time() - hit[0] < 1800:
         return hit[1]
-    data = collect_tab(tab_id, days)
+    # Vercel 함수 제한(60초) 안에 끝내려고 시간을 나눈다: 기사 수집 25초까지 + AI 호출은 52초 지점까지.
+    # 요약에는 기자 이름이 필요 없으므로 본문 페이지 접속(fill_authors)은 건너뛴다.
+    deadline = time.time() + 52
+    data = collect_tab(tab_id, days, authors=False, budget=25)
     if data.get("error"):
         return data
     groups = {}
@@ -825,10 +852,16 @@ def weekly_summary(days=7, tab_id=None):
               "건수가 많은 순으로 주요 이슈 3~6개를 '- **이슈명**: 한두 문장 설명' 형태의 목록으로. "
               "목록에 없는 내용은 추측하지 마세요.\n\n" + "\n".join(lines))
     try:
-        text = _ask_llm(prompt)
+        text = _ask_llm(prompt, deadline)
     except Exception as e:
+        if hit:  # AI 호출이 실패·지연되면 직전에 만든 요약(오래됐어도)을 대신 보여 준다
+            return hit[1]
         return {"error": f"AI 요약 호출 실패: {e}"}
     out = {"summary": text, "count": sum(map(len, groups.values())), "groups": len(groups),
            "generated": datetime.now(KST).strftime("%Y-%m-%d %H:%M"), "tab": tab_id}
+    if data.get("timed_out"):
+        # 일부 출처가 늦어 빠진 요약은 오래 기억·공유하지 않는다(CDN 은 errors 가 있으면 10초만 공유).
+        out["errors"] = data["errors"]
+        return out
     _cache[ck] = (time.time(), out)
     return out
