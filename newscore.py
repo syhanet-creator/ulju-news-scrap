@@ -90,7 +90,7 @@ _BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHT
 SIM_THRESHOLD = 0.4
 FETCH_TIMEOUT = 8  # 지역 신문 한 번 요청의 제한 시간(초). 시간 초과 시 한 번 더 시도한다.
 CLAUDE_MODEL = os.environ.get("SUMMARY_MODEL", "claude-haiku-4-5-20251001")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-lite-latest")  # 요약은 라이트 모델로 고정(빠르고 저렴)
 _cache = {}
 
 # ---------- 스팸/광고 제외 ----------
@@ -792,7 +792,7 @@ def _ask_llm(prompt, deadline=None):
     if gkey:
         last = None
         # 과부하(503)·모델 없음(404)·한도(429)면 다음 모델로 넘어간다.
-        for model in (GEMINI_MODEL, "gemini-flash-latest", "gemini-flash-lite-latest"):
+        for model in dict.fromkeys((GEMINI_MODEL, "gemini-flash-lite-latest", "gemini-flash-latest")):
             try:
                 r = _post_json(
                     f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
